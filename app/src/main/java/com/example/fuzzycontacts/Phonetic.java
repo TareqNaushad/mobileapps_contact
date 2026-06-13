@@ -104,12 +104,21 @@ public final class Phonetic {
         if (nq.isEmpty()) return 0;
         String nn = normalize(name);
         if (nn.isEmpty()) return 0;
+        return matchScorePre(nn, nn.split(" "), nq, nq.split(" "));
+    }
+
+    /**
+     * Same scoring as {@link #matchScore}, but takes the contact's name already
+     * normalized + tokenized (computed once at load time) and the query already
+     * normalized (computed once per search). This avoids re-normalizing every
+     * contact on every keystroke — the main source of typing lag.
+     */
+    public static int matchScorePre(String nn, String[] nTokens, String nq, String[] qTokens) {
+        if (nq.isEmpty() || nn.isEmpty()) return 0;
 
         int best = 0;
         if (nn.contains(nq)) best = 95;          // whole-name substring
 
-        String[] qTokens = nq.split(" ");
-        String[] nTokens = nn.split(" ");
         for (String qt : qTokens) {
             if (qt.isEmpty()) continue;
             for (String nt : nTokens) {

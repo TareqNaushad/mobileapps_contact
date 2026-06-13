@@ -7,6 +7,8 @@ import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.ContactsContract;
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -17,18 +19,27 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
 
     private static final int REQ_CONTACTS = 1;
+    private static final long DEBOUNCE_MS = 200;   // wait after last keystroke before searching
 
     static final class Contact {
         final String name;
         final String number;
-        Contact(String name, String number) { this.name = name; this.number = number; }
+        final String normName;      // pre-normalized once at load
+        final String[] normTokens;  // pre-tokenized once at load
+        Contact(String name, String number) {
+            this.name = name;
+            this.number = number;
+            this.normName = Phonetic.normalize(name);
+            this.normTokens = this.normName.isEmpty() ? new String[0] : this.normName.split(" ");
+        }
     }
 
     private final List<Contact> all = new ArrayList<>();   // every phone contact
@@ -38,6 +49,12 @@ public class MainActivity extends Activity {
     private TextView status;
     private ListView list;
     private ArrayAdapter<String> adapter;
+
+    // Debounce + background search
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final ExecutorService searchExec = Executors.newSingleThreadExecutor();
+    private Runnable pendingSearch;
+    private volatile long searchSeq = 0;   // discards results from stale (superseded) searches
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -60,7 +77,7 @@ public class MainActivity extends Activity {
         search.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
-            @Override public void afterTextChanged(Editable e) { update(e.toString()); }
+            @Override public void afterTextChanged(Editable e) { onQueryChanged(e.toString()); }
         });
 
         if (checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) {
@@ -97,44 +114,75 @@ public class MainActivity extends Activity {
                     String name = iName >= 0 ? c.getString(iName) : null;
                     String num = iNum >= 0 ? c.getString(iNum) : null;
                     if (name == null) name = "(no name)";
-                    if (num != null) all.add(new Contact(name, num));
+                    if (num != null) all.add(new Contact(name, num));  // normalization happens here, once
                 }
             }
         } catch (Exception ex) {
             Toast.makeText(this, "Failed to read contacts: " + ex.getMessage(), Toast.LENGTH_LONG).show();
         }
-        update(search.getText().toString());
+        runSearch(search.getText().toString());   // initial population (shows all)
     }
 
-    /** Rebuild the visible list for the given query. Empty query shows everything. */
-    private void update(String query) {
-        shown.clear();
-        String q = query == null ? "" : query.trim();
+    /** Called on every keystroke — just (re)schedules a debounced search. */
+    private void onQueryChanged(String query) {
+        if (pendingSearch != null) ui.removeCallbacks(pendingSearch);
+        final String q = query;
+        pendingSearch = () -> runSearch(q);
+        ui.postDelayed(pendingSearch, DEBOUNCE_MS);
+    }
 
-        if (q.isEmpty()) {
-            shown.addAll(all);
-        } else {
-            List<int[]> idxScore = new ArrayList<>(); // {index, score}
-            for (int i = 0; i < all.size(); i++) {
-                int sc = Phonetic.matchScore(all.get(i).name, q);
-                if (sc > 0) idxScore.add(new int[]{i, sc});
-            }
-            Collections.sort(idxScore, new Comparator<int[]>() {
-                @Override public int compare(int[] a, int[] b) {
-                    if (b[1] != a[1]) return b[1] - a[1];            // higher score first
-                    return all.get(a[0]).name.compareToIgnoreCase(all.get(b[0]).name);
-                }
+    /** Runs the (potentially expensive) match on a background thread, posts results back. */
+    private void runSearch(final String query) {
+        final long mySeq = ++searchSeq;
+        searchExec.execute(() -> {
+            final List<Contact> result = compute(query);
+            final List<String> display = new ArrayList<>(result.size());
+            for (Contact c : result) display.add(c.name + "\n" + c.number);
+
+            ui.post(() -> {
+                if (mySeq != searchSeq) return;   // a newer search already ran; drop stale result
+                shown.clear();
+                shown.addAll(result);
+                adapter.clear();
+                adapter.addAll(display);
+                adapter.notifyDataSetChanged();
+                updateStatus(query.trim());
             });
-            for (int[] is : idxScore) shown.add(all.get(is[0]));
+        });
+    }
+
+    /** Pure matching/sorting — runs off the UI thread. Empty query returns everything. */
+    private List<Contact> compute(String query) {
+        String q = query == null ? "" : query.trim();
+        if (q.isEmpty()) return new ArrayList<>(all);
+
+        String nq = Phonetic.normalize(q);          // normalize the query ONCE
+        if (nq.isEmpty()) return new ArrayList<>(all);
+        String[] qTokens = nq.split(" ");
+
+        final List<Contact> matches = new ArrayList<>();
+        final List<Integer> scores = new ArrayList<>();
+        for (Contact c : all) {
+            int sc = Phonetic.matchScorePre(c.normName, c.normTokens, nq, qTokens);
+            if (sc > 0) { matches.add(c); scores.add(sc); }
         }
 
-        List<String> display = new ArrayList<>(shown.size());
-        for (Contact c : shown) display.add(c.name + "\n" + c.number);
+        Integer[] order = new Integer[matches.size()];
+        for (int i = 0; i < order.length; i++) order[i] = i;
+        java.util.Arrays.sort(order, new Comparator<Integer>() {
+            @Override public int compare(Integer a, Integer b) {
+                int sa = scores.get(a), sb = scores.get(b);
+                if (sb != sa) return sb - sa;                                   // higher score first
+                return matches.get(a).name.compareToIgnoreCase(matches.get(b).name);
+            }
+        });
 
-        adapter.clear();
-        adapter.addAll(display);
-        adapter.notifyDataSetChanged();
+        List<Contact> out = new ArrayList<>(matches.size());
+        for (int idx : order) out.add(matches.get(idx));
+        return out;
+    }
 
+    private void updateStatus(String q) {
         if (all.isEmpty()) {
             status.setText("No contacts found on this phone.");
         } else if (q.isEmpty()) {
@@ -152,5 +200,11 @@ public class MainActivity extends Activity {
         } else {
             Toast.makeText(this, "No dialer app found.", Toast.LENGTH_SHORT).show();
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        searchExec.shutdownNow();
     }
 }
